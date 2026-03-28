@@ -1,0 +1,265 @@
+---
+title: "G7 Multi-country vs Single-country Comparison"
+output: html_document
+---
+
+## Purpose
+
+This file combines the pooled G7 model and the country-specific G7 models into one reusable workflow.
+
+It does two things:
+
+1. prints a country-level comparison table using the five anchors as one composition;
+2. shows, for each G7 country, five anchor plots with three series: Observed, Multi-country, and Single-country.
+
+The code below is based on the final pooled G7 model `vg_pr5` and the final country-specific G7 models stored in `g7_models`. In the pooled model, `vg_pr5` adds a `country:policyRate` interaction on top of smooth terms for headline inflation, policy rate, real GDP, and USD exchange rate, and it substantially improves AIC/BIC relative to `vg_pr4`. In the country-specific models, the G7 sample is restricted to 2014-01-01 through 2024-01-01; most countries use four smooth terms with `ps.int = 5`, Italy uses `ps.int = 4`, Japan keeps `ps.int = 5` with stronger response adjustment and `Maxit.outer = 400`, and the United States removes `usdExchangeRate` and uses three smooth terms with `ps.int = 6`. These choices come directly from your two project PDFs.  
+
+## Assumed objects already available
+
+This file assumes the following objects already exist in your session because they are created in your main scripts:
+
+- `df2_10y`
+- `vg_pr5`
+- `g7_models`
+
+If they are not already in memory, run your original model-building code first.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+## 1. Basic settings
+
+```{r}
+comp <- c("bank", "govern", "growth", "market", "other")
+
+g7_countries <- c(
+  "Canada", "France", "Germany", "Italy",
+  "Japan", "United Kingdom", "United States"
+)
+
+multi_model <- vg_pr5
+```
+
+## 2. Helper functions
+
+```{r}
+mae_fun <- function(obs, fit) {
+  mean(abs(obs - fit), na.rm = TRUE)
+}
+
+rmse_fun <- function(obs, fit) {
+  sqrt(mean((obs - fit)^2, na.rm = TRUE))
+}
+
+extract_fit_matrix <- function(model, prefix, comp_names = comp) {
+  fit_mu <- as.matrix(fitted(model))
+  out <- as.data.frame(fit_mu[, comp_names, drop = FALSE])
+  names(out) <- paste0(comp_names, prefix)
+  out
+}
+```
+
+## 3. Build one comparison data set
+
+This section avoids repeating extraction code in later chunks.
+
+```{r}
+# Multi-country fitted values
+multi_fitted_data <- df2_10y %>%
+  arrange(country, date_m) %>%
+  bind_cols(extract_fit_matrix(multi_model, "_multi"))
+
+# Single-country fitted values
+single_fitted_list <- vector("list", length(g7_countries))
+names(single_fitted_list) <- g7_countries
+
+for (cty in g7_countries) {
+  idx <- which(df2_10y$country == cty)
+  ord <- order(df2_10y$date_m[idx])
+
+  dat_cty <- df2_10y[idx[ord], ]
+  dat_cty <- bind_cols(dat_cty, extract_fit_matrix(g7_models[[cty]], "_single"))
+
+  single_fitted_list[[cty]] <- dat_cty
+}
+
+single_fitted_data <- bind_rows(single_fitted_list)
+
+# Merge observed, pooled fitted, and country-specific fitted values
+compare_df <- multi_fitted_data %>%
+  select(
+    country, date_m,
+    all_of(comp),
+    ends_with("_multi")
+  ) %>%
+  left_join(
+    single_fitted_data %>%
+      select(country, date_m, ends_with("_single")),
+    by = c("country", "date_m")
+  ) %>%
+  arrange(country, date_m)
+```
+
+## 4. Composition-level error table
+
+Here the five anchors are treated as one composition. Each country therefore gets four numbers:
+
+- `multi_MAE`
+- `multi_RMSE`
+- `single_MAE`
+- `single_RMSE`
+
+```{r}
+error_composition_country <- bind_rows(lapply(g7_countries, function(cty) {
+
+  tmp <- compare_df %>%
+    filter(country == cty) %>%
+    arrange(date_m)
+
+  obs_mat <- as.matrix(tmp[, comp])
+  fit_multi_mat <- as.matrix(tmp[, paste0(comp, "_multi")])
+  fit_single_mat <- as.matrix(tmp[, paste0(comp, "_single")])
+
+  obs_vec <- as.vector(obs_mat)
+  fit_multi_vec <- as.vector(fit_multi_mat)
+  fit_single_vec <- as.vector(fit_single_mat)
+
+  data.frame(
+    country = cty,
+    multi_MAE = mae_fun(obs_vec, fit_multi_vec),
+    multi_RMSE = rmse_fun(obs_vec, fit_multi_vec),
+    single_MAE = mae_fun(obs_vec, fit_single_vec),
+    single_RMSE = rmse_fun(obs_vec, fit_single_vec)
+  )
+})) %>%
+  arrange(country) %>%
+  mutate(
+    multi_MAE = round(multi_MAE, 4),
+    multi_RMSE = round(multi_RMSE, 4),
+    single_MAE = round(single_MAE, 4),
+    single_RMSE = round(single_RMSE, 4)
+  )
+
+print(error_composition_country)
+```
+
+## 5. Plot helper
+
+This plotting function returns a `ggplot` object, so it can be shown with `print()` in a loop and in knitted Markdown output.
+
+```{r}
+plot_country_5anchors <- function(cty_name, data_plot = compare_df) {
+
+  tmp <- data_plot %>%
+    filter(country == cty_name) %>%
+    arrange(date_m)
+
+  obs_long <- tmp %>%
+    select(country, date_m, all_of(comp)) %>%
+    pivot_longer(
+      cols = all_of(comp),
+      names_to = "anchor",
+      values_to = "value"
+    ) %>%
+    mutate(model = "Observed")
+
+  multi_long <- tmp %>%
+    select(country, date_m, all_of(paste0(comp, "_multi"))) %>%
+    rename_with(~ sub("_multi$", "", .x)) %>%
+    pivot_longer(
+      cols = all_of(comp),
+      names_to = "anchor",
+      values_to = "value"
+    ) %>%
+    mutate(model = "Multi-country")
+
+  single_long <- tmp %>%
+    select(country, date_m, all_of(paste0(comp, "_single"))) %>%
+    rename_with(~ sub("_single$", "", .x)) %>%
+    pivot_longer(
+      cols = all_of(comp),
+      names_to = "anchor",
+      values_to = "value"
+    ) %>%
+    mutate(model = "Single-country")
+
+  plot_df <- bind_rows(obs_long, multi_long, single_long) %>%
+    mutate(
+      anchor = factor(anchor, levels = comp),
+      model = factor(model, levels = c("Observed", "Multi-country", "Single-country"))
+    )
+
+  ggplot(plot_df, aes(x = date_m, y = value, linetype = model, linewidth = model)) +
+    geom_line() +
+    facet_wrap(~ anchor, ncol = 2, scales = "free_y") +
+    scale_linetype_manual(
+      values = c(
+        "Observed" = "dotted",
+        "Multi-country" = "solid",
+        "Single-country" = "longdash"
+      )
+    ) +
+    scale_linewidth_manual(
+      values = c(
+        "Observed" = 0.4,
+        "Multi-country" = 0.9,
+        "Single-country" = 0.9
+      )
+    ) +
+    labs(
+      title = cty_name,
+      x = "Date",
+      y = "Proportion"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      strip.text = element_text(face = "bold"),
+      legend.title = element_blank(),
+      legend.position = "top"
+    )
+}
+```
+
+## 6. Show one example
+
+```{r fig.width=11, fig.height=8}
+p_canada <- plot_country_5anchors("Canada")
+print(p_canada)
+```
+
+## 7. Show all G7 countries directly in the document
+
+No PDF device is opened here. Each country plot is displayed directly using `print()`.
+
+```{r fig.width=11, fig.height=8, results='asis'}
+for (cty in g7_countries) {
+  print(plot_country_5anchors(cty))
+}
+```
+
+## 8. Optional: print the model-specific tuning summary
+
+This small table keeps the final single-country specifications in one place.
+
+```{r}
+model_spec_table <- data.frame(
+  country = g7_countries,
+  n_smooth_terms = c(4, 4, 4, 4, 4, 4, 3),
+  ps_int_used = c(5, 5, 5, 4, 5, 5, 6),
+  special_note = c(
+    "standard single-country version",
+    "standard single-country version",
+    "standard single-country version",
+    "ps.int reduced to 4 for stability",
+    "stronger response adjustment; Maxit.outer = 400",
+    "standard single-country version",
+    "usdExchangeRate removed"
+  )
+)
+
+print(model_spec_table)
+```

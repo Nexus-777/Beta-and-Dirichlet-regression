@@ -1,0 +1,824 @@
+---
+title: "G7 model"
+author: "Xiwei Zhang"
+date: "2026-03-07"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r prepare}
+library(VGAM)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(readxl)
+library(stringr)
+library(lubridate)
+library(zoo)
+```
+
+```{r country codes}
+code_to_country <- c(
+  AR = "Argentina",
+  AU = "Australia",
+  BR = "Brazil",
+  CA = "Canada",
+  CN = "China",
+  DE = "Germany",
+  FR = "France",
+  GB = "United Kingdom",
+  ID = "Indonesia",
+  IN = "India",
+  IT = "Italy",
+  JP = "Japan",
+  KR = "Korea, Republic of",
+  MX = "Mexico",
+  RU = "Russian Federation",
+  SA = "Saudi Arabia",
+  TR = "Turkey",
+  US = "United States",
+  ZA = "South Africa",
+  XM = "Other_ECB"
+)
+```
+
+```{r build 5-anchor composition  }
+topic <- read_csv(
+  "/Users/zhangxiwei/Downloads/g20bis_monthly_topic_proportions.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(
+    date = as.Date(date),
+    date_m = floor_date(date, "month"),
+    anchor5 = if_else(anchor %in% c("market", "bank", "growth", "govern"),
+                      anchor, "other"),
+    avg_proportion = as.numeric(avg_proportion)
+  ) %>%
+  group_by(country, date_m, anchor5) %>%
+  summarise(
+    avg_proportion = sum(avg_proportion, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = anchor5,
+    values_from = avg_proportion,
+    values_fill = 0
+  ) %>%
+  filter(date_m >= as.Date("2010-01-01"))
+
+## quick check
+print(names(topic))
+print(head(topic))
+```
+
+```{r real GDP convert to monthly}
+real_m <- read_excel(
+  "/Users/zhangxiwei/Downloads/macro_control_vars.xlsx",
+  sheet = "realGDP"
+) %>%
+  rename(date = 1) %>%
+  pivot_longer(-date, names_to = "series", values_to = "realGDP") %>%
+  mutate(
+    date = as.Date(date),
+    code = str_extract(series, "[A-Z]{2,3}$"),
+    country = recode(code, !!!code_to_country),
+    q = as.yearqtr(date),
+    q_start = as.Date(q, frac = 0)
+  ) %>%
+  filter(!is.na(country)) %>%
+  group_by(country, q, q_start) %>%
+  summarise(
+    realGDP = mean(realGDP, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    date_m = list(seq.Date(q_start, by = "month", length.out = 3))
+  ) %>%
+  unnest(date_m) %>%
+  ungroup() %>%
+  select(country, date_m, realGDP)
+```
+
+```{r Read the other 3 macro variables as monthly data}
+read_monthly_sheet <- function(sheet_name) {
+  read_excel(
+    "/Users/zhangxiwei/Downloads/macro_control_vars.xlsx",
+    sheet = sheet_name
+  ) %>%
+    rename(date = 1) %>%
+    pivot_longer(-date, names_to = "series", values_to = "value") %>%
+    mutate(
+      date = as.Date(date),
+      date_m = floor_date(date, "month"),
+      code = str_extract(series, "[A-Z]{2,3}$"),
+      country = recode(code, !!!code_to_country)
+    ) %>%
+    filter(!is.na(country)) %>%
+    group_by(country, date_m) %>%
+    summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    rename(!!sheet_name := value)
+}
+
+headline_m <- read_monthly_sheet("headlineInflation")
+usd_m      <- read_monthly_sheet("usdExchangeRate")
+policy_m   <- read_monthly_sheet("policyRate")
+
+# 5. Build macro panel
+macro_panel <- real_m %>%
+  full_join(headline_m, by = c("country", "date_m")) %>%
+  full_join(usd_m,      by = c("country", "date_m")) %>%
+  full_join(policy_m,   by = c("country", "date_m")) %>%
+  filter(date_m >= as.Date("2010-01-01"))
+
+print(head(macro_panel))
+
+final_table <- inner_join(
+  topic,
+  macro_panel,
+  by = c("country", "date_m")
+) %>%
+  arrange(country, date_m)
+
+print(final_table, width = Inf, n = 20)
+
+```
+
+```{r Dirichlet regression }
+comp_cols <- c("bank", "govern", "growth", "market", "other")
+
+df2 <- final_table %>%
+  select(
+    country, date_m, all_of(comp_cols),
+    realGDP, headlineInflation, usdExchangeRate, policyRate
+  ) %>%
+  na.omit()
+```
+
+```{r G7 model preapre }
+comp_cols <- c("bank","govern","growth","market","other")
+
+df2 <- final_table %>%
+  select(country, date_m, all_of(comp_cols),
+         realGDP, headlineInflation, usdExchangeRate, policyRate) %>%
+  na.omit()
+
+df2[comp_cols] <- lapply(df2[comp_cols], as.numeric)
+S <- rowSums(df2[, comp_cols])
+df2[, comp_cols] <- df2[, comp_cols] / S
+
+eps <- 1e-3
+K <- length(comp_cols)
+df2[, comp_cols] <- (df2[, comp_cols] + eps) / (1 + K * eps)
+
+delta <- 0.002
+df2[, comp_cols] <- (1 - delta) * df2[, comp_cols] + delta * (1 / K)
+
+g7_countries <- c(
+  "Canada",
+  "France",
+  "Germany",
+  "Italy",
+  "Japan",
+  "United Kingdom",
+  "United States"
+)
+
+df2_10y <- df2 %>%
+  dplyr::filter(
+    country %in% g7_countries,
+    date_m >= as.Date("2014-01-01"),
+    date_m <= as.Date("2024-01-01")
+  ) %>%
+  droplevels() %>%
+  dplyr::mutate(
+    country = factor(country),
+    timeIndex = (as.integer(format(date_m, "%Y")) - 2015) * 12 +
+      as.integer(format(date_m, "%m")) + 1,
+    timeIndex_s = as.numeric(scale(timeIndex))
+  )
+
+df2_10y$headlineInflation_s <- as.numeric(scale(df2_10y$headlineInflation))
+df2_10y$policyRate_s        <- as.numeric(scale(df2_10y$policyRate))
+df2_10y$usdExchangeRate_s   <- as.numeric(scale(df2_10y$usdExchangeRate))
+df2_10y$realGDP_s           <- as.numeric(scale(df2_10y$realGDP))
+df2_10y$country             <- droplevels(factor(df2_10y$country))
+
+```
+
+```{r G7 model }
+
+# G7 single-country models: final version
+
+
+# 1) Response adjustment
+comp <- c("bank", "govern", "growth", "market", "other")
+y <- as.matrix(df2_10y[, comp])
+
+K <- ncol(y)
+
+y_adj <- y
+y_adj[y_adj < 0] <- 0
+y_adj <- y_adj / rowSums(y_adj)
+
+eps_resp <- 1e-3
+y_adj <- (y_adj + eps_resp) / (1 + K * eps_resp)
+
+delta_resp <- 0.002
+y_adj <- (1 - delta_resp) * y_adj + delta_resp * (1 / K)
+
+y_adj <- y_adj / rowSums(y_adj)
+storage.mode(y_adj) <- "double"
+
+## 2) Safe scaling helper
+safe_scale <- function(x) {
+  x <- as.numeric(x)
+  s <- sd(x, na.rm = TRUE)
+  m <- mean(x, na.rm = TRUE)
+
+  if (!is.finite(s) || s == 0) {
+    return(rep(0, length(x)))
+  }
+
+  (x - m) / s
+}
+
+# 3) Fit main countries except US and Japan
+#    Italy uses ps.int = 4
+#    others use ps.int = 5
+
+g7_models <- list()
+
+main_countries <- c("Canada", "France", "Germany", "Italy", "United Kingdom")
+
+for (cty in main_countries) {
+  cat("\n====================\n")
+  cat("Fitting:", cty, "\n")
+
+  idx <- which(df2_10y$country == cty)
+  ord <- order(df2_10y$date_m[idx])
+
+  dat_cty <- df2_10y[idx[ord], ]
+  y_cty   <- y_adj[idx[ord], , drop = FALSE]
+
+  dat_cty$headlineInflation_sc <- safe_scale(dat_cty$headlineInflation)
+  dat_cty$policyRate_sc        <- safe_scale(dat_cty$policyRate)
+  dat_cty$realGDP_sc           <- safe_scale(dat_cty$realGDP)
+  dat_cty$usdExchangeRate_sc   <- safe_scale(dat_cty$usdExchangeRate)
+
+  if (!is.finite(sd(dat_cty$headlineInflation, na.rm = TRUE)) || sd(dat_cty$headlineInflation, na.rm = TRUE) == 0) {
+    dat_cty$headlineInflation_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_cty))
+  }
+  if (!is.finite(sd(dat_cty$policyRate, na.rm = TRUE)) || sd(dat_cty$policyRate, na.rm = TRUE) == 0) {
+    dat_cty$policyRate_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_cty))
+  }
+  if (!is.finite(sd(dat_cty$realGDP, na.rm = TRUE)) || sd(dat_cty$realGDP, na.rm = TRUE) == 0) {
+    dat_cty$realGDP_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_cty))
+  }
+  if (!is.finite(sd(dat_cty$usdExchangeRate, na.rm = TRUE)) || sd(dat_cty$usdExchangeRate, na.rm = TRUE) == 0) {
+    dat_cty$usdExchangeRate_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_cty))
+  }
+
+  ps_use <- if (cty == "Italy") 4 else 5
+
+  fit <- try(
+    vgam(
+      y_cty ~
+        sm.ps(headlineInflation_sc, ps.int = ps_use) +
+        sm.ps(policyRate_sc, ps.int = ps_use) +
+        sm.ps(realGDP_sc, ps.int = ps_use) +
+        sm.ps(usdExchangeRate_sc, ps.int = ps_use),
+      family = dirichlet(),
+      data = dat_cty,
+      control = vgam.control(Maxit.outer = 200, trace = FALSE)
+    ),
+    silent = TRUE
+  )
+
+  g7_models[[cty]] <- fit
+
+  if (inherits(fit, "try-error")) {
+    cat("FAILED:", cty, "\n")
+  } else {
+    cat("OK:", cty, "| ps.int =", ps_use, "\n")
+  }
+}
+
+
+# 4) Japan: special final version
+# keep ps.int = 5, stronger adjustment, Maxit.outer = 400
+
+cty <- "Japan"
+
+cat("\n====================\n")
+cat("Fitting:", cty, "(special model)\n")
+
+idx <- which(df2_10y$country == cty)
+ord <- order(df2_10y$date_m[idx])
+
+dat_jp <- df2_10y[idx[ord], ]
+y_jp   <- as.matrix(df2_10y[idx[ord], c("bank", "govern", "growth", "market", "other")])
+
+K_jp <- ncol(y_jp)
+
+y_jp[y_jp < 0] <- 0
+y_jp <- y_jp / rowSums(y_jp)
+
+eps_jp <- 2e-3
+y_jp <- (y_jp + eps_jp) / (1 + K_jp * eps_jp)
+
+delta_jp <- 0.003
+y_jp <- (1 - delta_jp) * y_jp + delta_jp * (1 / K_jp)
+
+y_jp <- y_jp / rowSums(y_jp)
+storage.mode(y_jp) <- "double"
+
+dat_jp$headlineInflation_sc <- safe_scale(dat_jp$headlineInflation)
+dat_jp$policyRate_sc        <- safe_scale(dat_jp$policyRate)
+dat_jp$realGDP_sc           <- safe_scale(dat_jp$realGDP)
+dat_jp$usdExchangeRate_sc   <- safe_scale(dat_jp$usdExchangeRate)
+
+if (!is.finite(sd(dat_jp$headlineInflation, na.rm = TRUE)) || sd(dat_jp$headlineInflation, na.rm = TRUE) == 0) {
+  dat_jp$headlineInflation_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_jp))
+}
+if (!is.finite(sd(dat_jp$policyRate, na.rm = TRUE)) || sd(dat_jp$policyRate, na.rm = TRUE) == 0) {
+  dat_jp$policyRate_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_jp))
+}
+if (!is.finite(sd(dat_jp$realGDP, na.rm = TRUE)) || sd(dat_jp$realGDP, na.rm = TRUE) == 0) {
+  dat_jp$realGDP_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_jp))
+}
+if (!is.finite(sd(dat_jp$usdExchangeRate, na.rm = TRUE)) || sd(dat_jp$usdExchangeRate, na.rm = TRUE) == 0) {
+  dat_jp$usdExchangeRate_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_jp))
+}
+
+fit_jp <- try(
+  vgam(
+    y_jp ~
+      sm.ps(headlineInflation_sc, ps.int = 5) +
+      sm.ps(policyRate_sc, ps.int = 5) +
+      sm.ps(realGDP_sc, ps.int = 5) +
+      sm.ps(usdExchangeRate_sc, ps.int = 5),
+    family = dirichlet(),
+    data = dat_jp,
+    control = vgam.control(Maxit.outer = 400, trace = FALSE)
+  ),
+  silent = TRUE
+)
+
+g7_models[["Japan"]] <- fit_jp
+
+if (inherits(fit_jp, "try-error")) {
+  cat("FAILED: Japan\n")
+} else {
+  cat("OK: Japan | ps.int = 5 | Maxit.outer = 400\n")
+}
+
+
+# 5) United States: separate model without usdExchangeRate
+cty <- "United States"
+
+cat("\n====================\n")
+cat("Fitting:", cty, "(separate model)\n")
+
+idx <- which(df2_10y$country == cty)
+ord <- order(df2_10y$date_m[idx])
+
+dat_us <- df2_10y[idx[ord], ]
+y_us   <- y_adj[idx[ord], , drop = FALSE]
+
+dat_us$headlineInflation_sc <- safe_scale(dat_us$headlineInflation)
+dat_us$policyRate_sc        <- safe_scale(dat_us$policyRate)
+dat_us$realGDP_sc           <- safe_scale(dat_us$realGDP)
+
+s_hi  <- sd(dat_us$headlineInflation, na.rm = TRUE)
+s_pr  <- sd(dat_us$policyRate, na.rm = TRUE)
+s_gdp <- sd(dat_us$realGDP, na.rm = TRUE)
+
+if (!is.finite(s_hi) || is.na(s_hi) || s_hi == 0) {
+  dat_us$headlineInflation_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_us))
+}
+if (!is.finite(s_pr) || is.na(s_pr) || s_pr == 0) {
+  dat_us$policyRate_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_us))
+}
+if (!is.finite(s_gdp) || is.na(s_gdp) || s_gdp == 0) {
+  dat_us$realGDP_sc <- seq(-1e-6, 1e-6, length.out = nrow(dat_us))
+}
+
+fit_us <- try(
+  vgam(
+    y_us ~
+      sm.ps(headlineInflation_sc, ps.int = 6) +
+      sm.ps(policyRate_sc, ps.int = 6) +
+      sm.ps(realGDP_sc, ps.int = 6),
+    family = dirichlet(),
+    data = dat_us,
+    control = vgam.control(Maxit.outer = 200, trace = FALSE)
+  ),
+  silent = TRUE
+)
+
+g7_models[["United States"]] <- fit_us
+
+if (inherits(fit_us, "try-error")) {
+  cat("FAILED: United States\n")
+} else {
+  cat("OK: United States | ps.int = 6 | usdExchangeRate removed\n")
+}
+
+
+# 6) AIC / BIC table
+ok_models <- sapply(g7_models, function(x) inherits(x, "vglm"))
+ok_countries <- names(g7_models)[ok_models]
+
+ps_used <- ifelse(
+  ok_countries == "Italy", 4,
+  ifelse(ok_countries == "Japan", 5,
+         ifelse(ok_countries == "United States", 6, 5))
+)
+
+n_smooth_terms <- ifelse(ok_countries == "United States", 3, 4)
+
+g7_model_compare <- data.frame(
+  country = ok_countries,
+  n_smooth_terms = n_smooth_terms,
+  ps_int_used = ps_used,
+  AIC = sapply(g7_models[ok_countries], AIC),
+  BIC = sapply(g7_models[ok_countries], BIC)
+)
+
+print(g7_model_compare)
+
+```
+# In the country-specific models, most countries retained the same four smooth macroeconomic covariates as in the  final model with ps.int = 5, since this provided the best practical balance between visible nonlinear wiggliness, numerical stability, and computational feasibility. Italy was estimated with ps.int = 4 because the four-smooth model became unstable at ps.int = 5, while Japan kept ps.int = 5 after a slightly stronger response adjustment and a larger outer-iteration limit, and the United States was modeled separately with three smooth terms because usdExchangeRate showed essentially no within-country variation and was therefore not identifiable. The output should therefore be interpreted as showing that country-specific models can better capture some medium-run national dynamics, but they are generally harder to fit than the pooled final model, and their AIC/BIC values are most meaningful for model choice within each country rather than for direct cross-country ranking.
+```{r G7 model plots }
+g7_fitted_data <- list()
+
+for (cty in ok_countries) {
+  idx <- which(df2_10y$country == cty)
+  ord <- order(df2_10y$date_m[idx])
+
+  dat_cty <- df2_10y[idx[ord], ]
+  fit_mu <- fitted(g7_models[[cty]])
+
+  dat_cty$bank_fit   <- fit_mu[, "bank"]
+  dat_cty$govern_fit <- fit_mu[, "govern"]
+  dat_cty$growth_fit <- fit_mu[, "growth"]
+  dat_cty$market_fit <- fit_mu[, "market"]
+  dat_cty$other_fit  <- fit_mu[, "other"]
+
+  g7_fitted_data[[cty]] <- dat_cty
+}
+
+
+# Plot function
+
+plot_bank_fit <- function(cty_name) {
+  tmp <- g7_fitted_data[[cty_name]]
+
+  plot(
+    tmp$date_m, tmp$growth,
+    type = "l",
+    xlab = "Date",
+    ylab = "bank proportion",
+    main = paste("Observed vs Fitted (bank) -", cty_name)
+  )
+
+  lines(tmp$date_m, tmp$growth_fit, lty = 2)
+
+  legend(
+    "topright",
+    legend = c("Observed", "Fitted"),
+    lty = c(1, 2),
+    bty = "n"
+  )
+}
+
+
+#  Draw plots
+
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), cex.main = 1.0, cex.lab = 1, cex.axis = 0.9)
+
+for (cty in c("Canada", "France", "Germany", "Italy")) {
+  plot_bank_fit(cty)
+}
+
+par(old_par)
+
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), cex.main = 1.0, cex.lab = 1, cex.axis = 0.9)
+
+for (cty in c("United Kingdom", "Japan", "United States")) {
+  plot_bank_fit(cty)
+}
+
+par(old_par)
+```
+#Although ps.int = 6 is theoretically more flexible, it was computationally infeasible for the single-country models; for example, the Canada model did not finish within about one hour under this specification. In contrast, ps.int = 5 remained practically estimable and was sufficiently flexible to capture the main nonlinear patterns. Additional comparisons for selected countries also indicated that ps.int = 5 performed better than ps.int = 4, so ps.int = 5 was adopted as a practical compromise between model flexibility and computational feasibility.
+
+```{r G7 multi vs single  }
+
+library(dplyr)
+
+# 0. Basic settings
+
+comp <- c("bank", "govern", "growth", "market", "other")
+
+g7_countries <- c(
+  "Canada", "France", "Germany", "Italy",
+  "Japan", "United Kingdom", "United States"
+)
+
+multi_model <- vg_pr5
+
+
+# 1. Multi-country fitted values
+
+multi_fit_mu <- as.matrix(fitted(multi_model))
+
+multi_fitted_data <- df2_10y %>%
+  arrange(country, date_m) %>%
+  mutate(
+    bank_multi   = multi_fit_mu[, "bank"],
+    govern_multi = multi_fit_mu[, "govern"],
+    growth_multi = multi_fit_mu[, "growth"],
+    market_multi = multi_fit_mu[, "market"],
+    other_multi  = multi_fit_mu[, "other"]
+  )
+
+
+# 2. Single-country fitted values
+
+single_fitted_list <- list()
+
+for (cty in g7_countries) {
+  idx <- which(df2_10y$country == cty)
+  ord <- order(df2_10y$date_m[idx])
+
+  dat_cty <- df2_10y[idx[ord], ]
+
+  fit_mu_single <- as.matrix(fitted(g7_models[[cty]]))
+
+  dat_cty$bank_single   <- fit_mu_single[, "bank"]
+  dat_cty$govern_single <- fit_mu_single[, "govern"]
+  dat_cty$growth_single <- fit_mu_single[, "growth"]
+  dat_cty$market_single <- fit_mu_single[, "market"]
+  dat_cty$other_single  <- fit_mu_single[, "other"]
+
+  single_fitted_list[[cty]] <- dat_cty
+}
+
+single_fitted_data <- bind_rows(single_fitted_list)
+
+
+# 3. Merge observed, multi-country, and single-country values
+
+compare_df <- multi_fitted_data %>%
+  select(
+    country, date_m,
+    bank, govern, growth, market, other,
+    bank_multi, govern_multi, growth_multi, market_multi, other_multi
+  ) %>%
+  left_join(
+    single_fitted_data %>%
+      select(
+        country, date_m,
+        bank_single, govern_single, growth_single, market_single, other_single
+      ),
+    by = c("country", "date_m")
+  ) %>%
+  arrange(country, date_m)
+
+
+# 4. Plot function: one country = 5 anchor plots
+
+plot_country_5anchors <- function(cty_name, data_plot = compare_df) {
+
+  tmp <- data_plot %>%
+    filter(country == cty_name) %>%
+    arrange(date_m)
+
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(3, 2),
+    mar = c(4.2, 4.2, 2.8, 1.2),
+    oma = c(0.5, 0.5, 2.2, 0.5),
+    cex.main = 1.05,
+    cex.lab = 0.95,
+    cex.axis = 0.9
+  )
+
+  # bank
+  yr <- range(c(tmp$bank, tmp$bank_multi, tmp$bank_single), na.rm = TRUE)
+  plot(tmp$date_m, tmp$bank,
+       type = "l", lwd = 1, lty = 3,
+       xlab = "Date", ylab = "Proportion",
+       main = "bank", ylim = yr)
+  lines(tmp$date_m, tmp$bank_multi,  lwd = 2.4, lty = 1)
+  lines(tmp$date_m, tmp$bank_single, lwd = 2.4, lty = 2)
+  legend("topright",
+         legend = c("Observed", "Multi-country", "Single-country"),
+         lty = c(3, 1, 2), lwd = c(1, 2.4, 2.4),
+         bty = "n", cex = 0.82)
+
+  # govern
+  yr <- range(c(tmp$govern, tmp$govern_multi, tmp$govern_single), na.rm = TRUE)
+  plot(tmp$date_m, tmp$govern,
+       type = "l", lwd = 1, lty = 3,
+       xlab = "Date", ylab = "Proportion",
+       main = "govern", ylim = yr)
+  lines(tmp$date_m, tmp$govern_multi,  lwd = 2.4, lty = 1)
+  lines(tmp$date_m, tmp$govern_single, lwd = 2.4, lty = 2)
+  legend("topright",
+         legend = c("Observed", "Multi-country", "Single-country"),
+         lty = c(3, 1, 2), lwd = c(1, 2.4, 2.4),
+         bty = "n", cex = 0.82)
+
+  # growth
+  yr <- range(c(tmp$growth, tmp$growth_multi, tmp$growth_single), na.rm = TRUE)
+  plot(tmp$date_m, tmp$growth,
+       type = "l", lwd = 1, lty = 3,
+       xlab = "Date", ylab = "Proportion",
+       main = "growth", ylim = yr)
+  lines(tmp$date_m, tmp$growth_multi,  lwd = 2.4, lty = 1)
+  lines(tmp$date_m, tmp$growth_single, lwd = 2.4, lty = 2)
+  legend("topright",
+         legend = c("Observed", "Multi-country", "Single-country"),
+         lty = c(3, 1, 2), lwd = c(1, 2.4, 2.4),
+         bty = "n", cex = 0.82)
+
+  # market
+  yr <- range(c(tmp$market, tmp$market_multi, tmp$market_single), na.rm = TRUE)
+  plot(tmp$date_m, tmp$market,
+       type = "l", lwd = 1, lty = 3,
+       xlab = "Date", ylab = "Proportion",
+       main = "market", ylim = yr)
+  lines(tmp$date_m, tmp$market_multi,  lwd = 2.4, lty = 1)
+  lines(tmp$date_m, tmp$market_single, lwd = 2.4, lty = 2)
+  legend("topright",
+         legend = c("Observed", "Multi-country", "Single-country"),
+         lty = c(3, 1, 2), lwd = c(1, 2.4, 2.4),
+         bty = "n", cex = 0.82)
+
+  # other
+  yr <- range(c(tmp$other, tmp$other_multi, tmp$other_single), na.rm = TRUE)
+  plot(tmp$date_m, tmp$other,
+       type = "l", lwd = 1, lty = 3,
+       xlab = "Date", ylab = "Proportion",
+       main = "other", ylim = yr)
+  lines(tmp$date_m, tmp$other_multi,  lwd = 2.4, lty = 1)
+  lines(tmp$date_m, tmp$other_single, lwd = 2.4, lty = 2)
+  legend("topright",
+         legend = c("Observed", "Multi-country", "Single-country"),
+         lty = c(3, 1, 2), lwd = c(1, 2.4, 2.4),
+         bty = "n", cex = 0.82)
+
+  plot.new()
+
+  mtext(cty_name, outer = TRUE, cex = 1.5, font = 2)
+}
+
+
+
+
+# 5. Export all G7 countries to one PDF
+
+pdf("G7_5anchor_observed_multi_single_clean.pdf", width = 12, height = 8.8)
+
+for (cty in g7_countries) {
+  plot_country_5anchors(cty)
+}
+
+dev.off()
+
+```
+# Increasing Maxit.outer from 200 to 400 leads to some improvement, but the change is not dramatic. For France, the fitted curve becomes slightly more stable and responsive to medium-run movements, while for Germany the improvement is more visible, especially around broader trend changes. This suggests that a higher outer-iteration limit can help some country-specific models reach a better solution, but the benefit is uneven across countries.
+
+```{r G7 multi vs single coefficient }
+
+
+#  Basic settings
+
+comp <- c("bank", "govern", "growth", "market", "other")
+
+g7_countries <- c(
+  "Canada", "France", "Germany", "Italy",
+  "Japan", "United Kingdom", "United States"
+)
+
+multi_model <- vg_pr5
+
+
+# 1. Multi-country fitted values
+
+multi_fit_mu <- as.matrix(fitted(multi_model))
+
+multi_fitted_data <- df2_10y %>%
+  arrange(country, date_m) %>%
+  mutate(
+    bank_multi   = multi_fit_mu[, "bank"],
+    govern_multi = multi_fit_mu[, "govern"],
+    growth_multi = multi_fit_mu[, "growth"],
+    market_multi = multi_fit_mu[, "market"],
+    other_multi  = multi_fit_mu[, "other"]
+  )
+
+
+# 2. Single-country fitted values
+
+single_fitted_list <- list()
+
+for (cty in g7_countries) {
+  idx <- which(df2_10y$country == cty)
+  ord <- order(df2_10y$date_m[idx])
+
+  dat_cty <- df2_10y[idx[ord], ]
+
+  fit_mu_single <- as.matrix(fitted(g7_models[[cty]]))
+
+  dat_cty$bank_single   <- fit_mu_single[, "bank"]
+  dat_cty$govern_single <- fit_mu_single[, "govern"]
+  dat_cty$growth_single <- fit_mu_single[, "growth"]
+  dat_cty$market_single <- fit_mu_single[, "market"]
+  dat_cty$other_single  <- fit_mu_single[, "other"]
+
+  single_fitted_list[[cty]] <- dat_cty
+}
+
+single_fitted_data <- bind_rows(single_fitted_list)
+
+
+# 3. Merge observed, multi-country, and single-country values
+
+compare_df <- multi_fitted_data %>%
+  select(
+    country, date_m,
+    bank, govern, growth, market, other,
+    bank_multi, govern_multi, growth_multi, market_multi, other_multi
+  ) %>%
+  left_join(
+    single_fitted_data %>%
+      select(
+        country, date_m,
+        bank_single, govern_single, growth_single, market_single, other_single
+      ),
+    by = c("country", "date_m")
+  ) %>%
+  arrange(country, date_m)
+
+
+# 4. Error functions
+
+mae_fun <- function(obs, fit) {
+  mean(abs(obs - fit), na.rm = TRUE)
+}
+
+rmse_fun <- function(obs, fit) {
+  sqrt(mean((obs - fit)^2, na.rm = TRUE))
+}
+
+
+# 5. Composition-level comparison:
+
+error_comp_list <- list()
+
+for (cty in g7_countries) {
+
+  tmp <- compare_df %>%
+    filter(country == cty) %>%
+    arrange(date_m)
+
+  # Observed composition values
+  obs_mat <- as.matrix(tmp[, comp])
+
+  # Multi-country fitted composition values
+  fit_multi_mat <- as.matrix(tmp[, paste0(comp, "_multi")])
+
+  # Single-country fitted composition values
+  fit_single_mat <- as.matrix(tmp[, paste0(comp, "_single")])
+
+  # Flatten matrices into vectors
+  obs_vec <- as.vector(obs_mat)
+  fit_multi_vec <- as.vector(fit_multi_mat)
+  fit_single_vec <- as.vector(fit_single_mat)
+
+  error_comp_list[[cty]] <- data.frame(
+    country = cty,
+    multi_MAE = mae_fun(obs_vec, fit_multi_vec),
+    multi_RMSE = rmse_fun(obs_vec, fit_multi_vec),
+    single_MAE = mae_fun(obs_vec, fit_single_vec),
+    single_RMSE = rmse_fun(obs_vec, fit_single_vec)
+  )
+}
+
+error_composition_country <- bind_rows(error_comp_list) %>%
+  arrange(country)
+
+
+# 6. Print results
+
+print(error_composition_country)
+```

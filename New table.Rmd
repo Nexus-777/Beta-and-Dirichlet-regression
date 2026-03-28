@@ -1,0 +1,729 @@
+---
+title: "Models"
+author: "Xiwei Zhang"
+date: "2026-01-26"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r prepare}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(readxl)
+library(lubridate)
+library(stringr)
+library(purrr)
+library(zoo)
+library(DirichletReg)
+library(VGAM)
+library(splines)
+```
+
+
+```{r code convert to countries}
+code_to_country <- c(
+  AR="Argentina", AU="Australia", BR="Brazil", CA="Canada", CN="China",
+  DE="Germany", FR="France", GB="United Kingdom", ID="Indonesia", IN="India",
+  IT="Italy", JP="Japan", KR="Korea, Republic of", MX="Mexico", RU="Russian Federation",
+  SA="Saudi Arabia", TR="Turkey", US="United States", ZA="South Africa", XM="Other_ECB"
+)
+```
+
+
+```{r 5 anchors}
+topic <- read_csv("/Users/zhangxiwei/Downloads/g20bis_monthly_topic_proportions.csv", show_col_types = FALSE) %>%
+  mutate(
+    date   = as.Date(date),
+    date_m = floor_date(date, "month"),
+    anchor5 = if_else(anchor %in% c("market","bank","growth","govern"), anchor, "other"),
+    avg_proportion = as.numeric(avg_proportion)
+  ) %>%
+  group_by(country, date_m, anchor5) %>%
+  summarise(avg_proportion = sum(avg_proportion, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = anchor5, values_from = avg_proportion, values_fill = 0) %>%
+  filter(date_m >= as.Date("2010-01-01"))
+```
+
+```{r Macro:realGDP convert to monthly}
+real_m <- read_excel("/Users/zhangxiwei/Downloads/macro_control_vars.xlsx", sheet = "realGDP") %>%
+  rename(date = 1) %>%
+  pivot_longer(-date, names_to = "series", values_to = "realGDP") %>%
+  mutate(
+    date = as.Date(date),
+    code = str_extract(series, "[A-Z]{2,3}$"),
+    country = recode(code, !!!code_to_country),
+    q = as.yearqtr(date),
+    q_start = as.Date(q, frac = 0)    # quarter start date
+  ) %>%
+  group_by(country, q) %>%
+  summarise(realGDP = mean(realGDP, na.rm = TRUE),
+            q_start = first(q_start), .groups = "drop") %>%
+  mutate(date_m = map(q_start, ~ seq(.x, by = "1 month", length.out = 3))) %>%
+  unnest(date_m) %>%
+  select(country, date_m, realGDP)
+```
+```{r Other 3 macro variables}
+read_monthly_sheet <- function(sheet_name){
+  read_excel("/Users/zhangxiwei/Downloads/macro_control_vars.xlsx", sheet = sheet_name) %>%
+    rename(date = 1) %>%
+    pivot_longer(-date, names_to = "series", values_to = sheet_name) %>%
+    mutate(
+      date = as.Date(date),
+      date_m = floor_date(date, "month"),
+      code = str_extract(series, "[A-Z]{2,3}$"),
+      country = recode(code, !!!code_to_country)
+    ) %>%
+    group_by(country, date_m) %>%
+    summarise("{sheet_name}" := mean(.data[[sheet_name]], na.rm = TRUE), .groups = "drop")
+}
+
+macro_panel <- real_m %>%
+  full_join(read_monthly_sheet("headlineInflation"), by = c("country","date_m")) %>%
+  full_join(read_monthly_sheet("usdExchangeRate"),    by = c("country","date_m")) %>%
+  full_join(read_monthly_sheet("policyRate"),         by = c("country","date_m")) %>%
+  filter(date_m >= as.Date("2010-01-01"))
+```
+```{r fianl table}
+final_wide <- macro_panel %>%
+  filter(date_m >= as.Date("2010-01-01"),
+         date_m <= as.Date("2024-12-01")) %>%
+  left_join(topic, by = c("country","date_m")) %>%
+  arrange(country, date_m)
+
+final_wide$id <- seq_len(nrow(final_wide))
+
+final_table <- inner_join(topic, macro_panel, by = c("country","date_m")) %>%
+  arrange(country, date_m)
+
+final_table
+print(final_table, width = Inf, n = 20)
+```
+
+```{r Dirichlet regression}
+comp_cols <- c("bank","govern","growth","market","other")
+
+df2 <- final_table %>%
+  select(country, date_m, all_of(comp_cols),
+         realGDP, headlineInflation, usdExchangeRate, policyRate) %>%
+  # filter(country != "Other_ECB") %>%
+  na.omit()
+
+```
+
+
+```{r Dirichlet regression 2}
+#  Renormalize  (protect against rounding so each row sums to 1)
+df2[comp_cols] <- lapply(df2[comp_cols], as.numeric)
+S <- rowSums(df2[, comp_cols])
+df2[, comp_cols] <- df2[, comp_cols] / S
+
+#  Zero handling
+eps <- 1e-3
+K <- length(comp_cols)
+df2[, comp_cols] <- (df2[, comp_cols] + eps) / (1 + K*eps)
+```
+
+```{r Dirichlet regression 3}
+delta <- 0.002
+df2[, comp_cols] <- (1 - delta) * df2[, comp_cols] + delta * (1 / K)
+Ymat <- data.matrix(df2[, comp_cols])
+df2$Y <- DR_data(Ymat, base = 5)
+
+
+x_cols <- c("realGDP","headlineInflation","usdExchangeRate","policyRate")
+df2[x_cols] <- lapply(df2[x_cols], function(z) as.numeric(scale(z)))
+m0<- tryCatch(
+  DirichReg(
+    Y ~ realGDP + headlineInflation + usdExchangeRate + policyRate | 1,
+    data = df2,
+    model = "alternative",
+    control = list(iterlim = 10000, tol1 = 1e-6, tol2 = 1e-12)
+  ),
+  error = function(e) e
+)
+
+summary(m0)
+
+
+
+```
+Using an alternative-parameterized Dirichlet regression with other as the reference component, you find that macroeconomic conditions are associated with systematic reallocations of the G20 composition across several categories. In particular, policyRate is a key driver: it is associated with a decrease in the bank share relative to other but a strong increase in the growth share relative to other. The USD exchange rate is positively associated with both govern and growth shares relative to other. Inflation is associated with a reduction in the growth share relative to other. By contrast, the market component shows no statistically significant dependence on the included macro variables in this specification. The precision submodel is intercept-only, implying a constant concentration level (estimated 
+$ϕ$≈38) across observations.
+
+
+```{r event indicator}
+df2 <- df2 %>%
+  mutate(
+    event_covid = as.integer(date_m >= as.Date("2020-03-01") & date_m <= as.Date("2021-12-01"))
+  )
+```
+
+```{r model2}
+m1 <- DirichReg(
+  Y ~ realGDP + headlineInflation + usdExchangeRate + policyRate + event_covid | 1,
+  data  = df2,
+  model = "alternative",
+  control = list(
+    iterlim = 5000,   
+    tol1 = 1e-6,
+    tol2 = 1e-12
+  ),
+  verbosity = 1
+)
+
+summary(m1)
+anova(m0, m1)   
+```
+An alternative-parameterized Dirichlet regression with other as the reference indicates that macro variables explain several systematic reallocations of the G20 composition, especially via policyRate and usdExchangeRate. Adding a COVID event indicator significantly improves model fit (p≈3.4e-12; logLik increases from 17914 to 17944). Conditional on macro controls, the COVID period is associated with a lower expected share of bank, growth, and market relative to other, and a higher expected share of govern relative to other. Precision remains intercept-only with $ϕ$≈38, implying constant dispersion and that COVID effects operate primarily through shifts in the mean composition.
+
+```{r plot1}
+library(ggplot2)
+library(scales)
+library(patchwork)
+comp4 <- c("bank","govern","growth","market")
+countries_to_plot <- c("Canada","China","United States")  # edit
+
+df_sub <- df2 %>%
+  filter(country %in% countries_to_plot) %>%
+  mutate(anchor_sum = bank + govern + growth + market,
+         bank_r   = bank   / anchor_sum,
+         govern_r = govern / anchor_sum,
+         growth_r = growth / anchor_sum,
+         market_r = market / anchor_sum)
+x_start <- as.Date(paste0(format(min(df_sub$date_m), "%Y"), "-01-01"))
+x_end   <- max(df_sub$date_m)
+
+year_axis <- scale_x_date(
+  date_breaks = "1 year",
+  date_labels = "%Y",
+  expand = expansion(mult = c(0.01, 0.01))
+)
+
+year_theme <- theme(
+  axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+  panel.grid.minor.x = element_blank()
+)
+
+year_theme <- theme(
+  axis.text.x = element_text(size = 12, angle = 0),
+  panel.grid.minor.x = element_line(linewidth = 0.25)
+)
+
+# Other (absolute share in the full composition)
+p_other <- df_sub %>%
+  select(country, date_m, other) %>%
+  ggplot(aes(x = date_m, y = other)) +
+  geom_line() +
+  facet_wrap(~ country, ncol = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "‘Other’ share over time (absolute)",
+       x = "Month", y = "Other share") +
+  theme_bw()
+
+#4 anchors renormalized
+p_anchors <- df_sub %>%
+  select(country, date_m, bank_r, govern_r, growth_r, market_r) %>%
+  pivot_longer(-c(country, date_m), names_to = "topic", values_to = "share") %>%
+  ggplot(aes(x = date_m, y = share, fill = topic)) +
+  geom_area() +
+  facet_wrap(~ country, ncol = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Anchor mix over time (renormalized within anchors)",
+       x = "Month", y = "Share within anchors") +
+  theme_bw()
+
+p_other  <- p_other  + year_axis + year_theme
+p_anchors <- p_anchors + year_axis + year_theme
+
+p_other / p_anchors
+
+```
+Across Canada, China, and the United States, the ‘Other’ category consistently represents the majority of total topic share, which shows that our four anchors are a targeted subset rather than a full description of all topics. After renormalizing within the anchors,we observe clear country-specific shifts in the relative balance of bank/govern/growth/market over time.
+
+Canada: Within the anchor subset, the mix is highly variable month-to-month, but overall it cycles among the four anchors with no single topic staying dominant for long.
+
+China: The anchor mix shows a clear regime change—early years are strongly growth-dominated, then the composition becomes more mixed and volatile later, with govern/market taking larger shares at times.
+
+United States: The anchor mix is comparatively steadier and more balanced, with bank often holding a relatively large share while the other anchors fluctuate around it.
+
+
+
+```{r beta regression}
+library(betareg)
+df_CA <- subset(df2, country == "Canada")
+
+
+eps <- 1e-4
+df_beta1$bank_beta <- (df_beta1$bank + eps) / (1 + 2 * eps)
+
+
+m_beta_simple <- betareg(
+  bank_beta ~ realGDP + headlineInflation + usdExchangeRate + policyRate,
+  data = df_CA,
+  link = "logit"
+)
+
+summary(m_beta_simple)
+
+```
+
+
+
+```{r improve original data}
+table(df2$country)
+
+drop_cty <- c("AR","Argentina","BR","Brazil","SA","Saudi Arabia",
+              "RU","Russian Federation","CN","China","ID","Indonesia")
+
+df2_10y <- df2 %>%          #past decade                          
+  dplyr::filter(date_m >= as.Date("2014-01-01"),
+                date_m <= as.Date("2024-01-01")) %>%  
+  dplyr::filter(!country %in% drop_cty) %>%
+  droplevels() %>%
+  dplyr::mutate(
+    country = factor(country),
+    timeIndex = (as.integer(format(date_m, "%Y")) - 2015) * 12 +
+                as.integer(format(date_m, "%m")) + 1,
+    timeIndex_s = as.numeric(scale(timeIndex))
+  )
+
+# scale X for VGAM
+df2_10y$headlineInflation_s <- as.numeric(scale(df2_10y$headlineInflation))
+df2_10y$policyRate_s        <- as.numeric(scale(df2_10y$policyRate))
+df2_10y$country             <- droplevels(factor(df2_10y$country))
+df2_10y$usdExchangeRate_s <- as.numeric(scale(df2_10y$usdExchangeRate))
+df2_10y$realGDP_s         <- as.numeric(scale(df2_10y$realGDP))
+
+
+library(mgcv)
+# gdp
+m_gdp0 <- gam(realGDP_s ~ country, data=df2_10y, method="REML")
+m_gdp1 <- gam(realGDP_s ~ country + s(timeIndex, k=10), data=df2_10y, method="REML")
+anova(m_gdp0, m_gdp1, test="F")  
+summary(m_gdp1)$dev.expl
+# usdExchange rate
+m_fx0  <- gam(usdExchangeRate_s ~ country, data=df2_10y, method="REML")
+m_fx1  <- gam(usdExchangeRate_s ~ country + s(timeIndex, k=10), data=df2_10y, method="REML")
+
+anova(m_fx0,  m_fx1,  test="F")
+summary(m_fx1)$dev.expl
+
+# policy rate
+m_pr0 <- gam(policyRate_s ~ country, data=df2_10y, method="REML")
+m_pr1 <- gam(policyRate_s ~ country + s(timeIndex, k=10), data=df2_10y, method="REML")
+anova(m_pr0, m_pr1, test="F")
+summary(m_pr1)$dev.expl
+
+# inflation
+m_inf0 <- gam(headlineInflation_s ~ country, data=df2_10y, method="REML")
+m_inf1 <- gam(headlineInflation_s ~ country + s(timeIndex, k=10), data=df2_10y, method="REML")
+anova(m_inf0, m_inf1, test="F")
+summary(m_inf1)$dev.expl
+
+```
+# We excluded countries with extremely limited usable observations, those sparse groups yield highly unstable country-specific effects, provide insufficient information to support smooth terms, and can cause numerical convergence issues in Dirichlet regression. The analysis therefore focuses on countries with adequate sample size to ensure stable estimation and comparable inference.
+# Auxiliary GAM checks show that policy rate and inflation are largely explained by country effects and a smooth time trend (deviance explained ≈ 0.89 and 0.91, respectively; FX ≈ 0.99). This indicates substantial overlap with the long-run time component. Therefore, in the Dirichlet regression we treat the smooth time term as the primary driver of long-run drift, while macro variables are interpreted mainly as additional controls or deviations beyond the long-run pattern.
+
+
+
+
+
+
+
+
+
+```{r new regression 1.0}
+
+
+comp <- c("bank","govern","growth","market","other")
+y <- as.matrix(df2_10y[, comp])
+
+eps <- 1e-6
+y_adj <- pmax(pmin(y, 1 - eps), eps)
+y_adj <- y_adj / rowSums(y_adj)
+
+Y <- y_adj
+storage.mode(Y) <- "double"
+
+options(useFancyQuotes = FALSE) ; storage.mode(Y) <- "double"
+cand <- c("headlineInflation_s","policyRate_s","usdExchangeRate_s","realGDP_s")
+
+
+fit_dir <- function(form){
+  vglm(form, dirichlet(), data=df2_10y,
+       control=vglm.control(maxit=5000, trace=FALSE, epsilon=1e-7))
+}
+BIC_vglm <- function(m){
+  ll <- as.numeric(logLik(m)); p <- length(coef(m)); n <- NROW(fitted(m))
+  -2*ll + log(n)*p
+}
+
+#  full smooth model (start of backward)
+full_form <- as.formula(paste0(
+  "I(Y) ~ country + ",
+  paste0("splines::ns(", cand, ", df=3)", collapse=" + ")
+))
+m_full <- fit_dir(full_form)
+
+# backward elimination over smooth terms 
+m_curr <- m_full
+best <- BIC_vglm(m_curr)
+path <- data.frame(step=0, action="start: all smooth(df=3)", BIC=best)
+
+repeat{
+  terms_now <- setdiff(attr(terms(formula(m_curr)), "term.labels"), "country")
+  
+  terms_now <- terms_now[grepl("^splines::ns\\(", terms_now)]
+  if(!length(terms_now)) break
+
+  tries <- lapply(terms_now, function(trm){
+    f_drop <- update(formula(m_curr), paste(". ~ . -", trm))
+    mm <- tryCatch(fit_dir(f_drop), error=function(e) NULL)
+    if(is.null(mm)) return(NULL)
+    data.frame(drop=trm, BIC=BIC_vglm(mm), stringsAsFactors=FALSE)
+  })
+  tries <- do.call(rbind, tries)
+  if(is.null(tries) || nrow(tries)==0) break
+
+  j <- which.min(tries$BIC)
+  if(tries$BIC[j] >= best) break   # no improvement => stop
+
+  # accept drop
+  drop_best <- tries$drop[j]
+  m_curr <- fit_dir(update(formula(m_curr), paste(". ~ . -", drop_best)))
+  best <- BIC_vglm(m_curr)
+  path <- rbind(path, data.frame(step=nrow(path),
+                                 action=paste0("drop ", drop_best),
+                                 BIC=best))
+}
+
+#  results 
+formula(m_curr)
+path
+```
+#For choosing variables and quickly comparing models, the basis selection approach is better.It is faster, more stable, and it is easy to run forward/backward selection. This helps me decide which variables should stay in the model.
+#For the final model, when I want to talk about non-linear effects and marginal effects, penalized smoothing is better.It controls the curve shape using a penalty, so the curve is not “too wiggly”. But it can be slow and harder to fit if I smooth too many variables at once.
+```{r one-step forward selection }
+
+
+Y <- as.matrix(y_adj); storage.mode(Y) <- "double"
+
+cand <- c("headlineInflation_s","policyRate_s","usdExchangeRate_s","realGDP_s")
+
+m_start <- vglm(
+  I(Y) ~ country,
+  dirichlet(),
+  data = df2_10y,
+  control = vglm.control(maxit=3000, trace=FALSE, epsilon=1e-7)
+)
+
+m_upper <- vglm(
+  as.formula(paste("I(Y) ~ country +", paste(cand, collapse=" + "))),
+  dirichlet(),
+  data = df2_10y,
+  control = vglm.control(maxit=3000, trace=FALSE, epsilon=1e-7)
+)
+
+kBIC  <- log(NROW(fitted(m_upper)))
+scope <- list(lower = formula(m_start), upper = formula(m_upper))
+
+
+m_lin_sel <- step4vglm(m_start, scope=scope, direction="forward", k=kBIC, trace=0)
+
+formula(m_lin_sel)
+setdiff(attr(terms(formula(m_lin_sel)), "term.labels"), "country")
+
+
+# For selected variables, replace linear with ns(df=3) if BIC improves
+
+fit_dir <- function(form){
+  suppressWarnings(
+    vglm(form, dirichlet(),
+         data = df2_10y,
+         control = vglm.control(maxit=5000, trace=FALSE, epsilon=1e-7, noWarning=TRUE))
+  )
+}
+
+BIC_vglm <- function(m){
+  ll <- as.numeric(logLik(m))
+  p  <- length(coef(m))
+  n  <- NROW(fitted(m))
+  -2*ll + log(n)*p
+}
+
+#  try replace linear by ns(df=3) if BIC improves 
+m_final <- m_lin_sel
+sel_terms <- setdiff(attr(terms(formula(m_lin_sel)), "term.labels"), "country")
+
+for(v in sel_terms){
+  f_now <- formula(m_final)
+  f_spl <- update(f_now, paste0(". ~ . - ", v, " + splines::ns(", v, ", df=3)"))
+
+  m1 <- tryCatch(fit_dir(f_now), error=function(e) NULL)
+  m2 <- tryCatch(fit_dir(f_spl), error=function(e) NULL)
+
+  if(is.null(m2)){
+    cat("FAILED:", v, "(spline fit failed)\n")
+    next
+  }
+
+  b1 <- if(is.null(m1)) Inf else BIC_vglm(m1)
+  b2 <- BIC_vglm(m2)
+
+  cat(sprintf("%s: BIC_linear=%.0f  BIC_smooth=%.0f  (delta=%.0f)\n",
+              v, b1, b2, b2-b1))
+
+  if(b2 < b1) m_final <- m2
+}
+
+formula(m_final)
+```
+
+
+
+
+
+
+```{r non-linear model 1.0}
+
+
+# response matrix (adjusted composition)
+Y <- as.matrix(y_adj)
+storage.mode(Y) <- "double"
+
+
+
+# Model 1 : only FX is smooth(df=2) 
+vg_time_pen <- vgam(
+  I(Y) ~ country  + headlineInflation_s + policyRate_s + realGDP_s +
+    sm.ps(usdExchangeRate_s, ps.int = 6),
+  family = dirichlet(),
+  data = df2_10y,
+  control = vgam.control(Maxit.outer = 80, trace = F)
+)
+
+#  Model 2 : policyRate and FX are smooth(df=2) 
+vg_time_pr_pen <- vgam(
+  I(Y) ~ country  + headlineInflation_s + realGDP_s +
+    sm.ps(policyRate_s, ps.int = 6) +
+    sm.ps(usdExchangeRate_s, ps.int = 6),
+  family = dirichlet(),
+  data = df2_10y,
+
+  control = vgam.control(Maxit.outer = 80, trace = F)
+)
+#  Metrics 
+IC_vglm <- function(m){
+  ll <- as.numeric(logLik(m))
+  p  <- length(coef(m))
+  n  <- NROW(fitted(m))
+  c(AIC = -2*ll + 2*p,
+    BIC = -2*ll + log(n)*p)
+}
+
+
+
+#Output 
+cat("Model 1 formula:\n"); print(formula(vg_time_pen))
+cat("Model 2 formula:\n"); print(formula(vg_time_pr_pen))
+
+cat("\nAIC/BIC:\n")
+print(rbind(
+  time    = IC_vglm(vg_time_pen),
+  time_pr = IC_vglm(vg_time_pr_pen)
+))
+```
+#I used BIC because it penalizes model complexity more strongly, which helps avoid overfitting and gives a simpler model. AIC is more liberal and tends to keep extra terms, especially with smooth functions.
+
+#I ran both forward and backward selection using BIC with country fixed effects always included. In both directions, BIC kept improving when adding each macro variable, and no variable could be removed without increasing BIC. After removing timeIndex to avoid overlapping trend effects, the same conclusion held: each macro covariate still contributed additional explanatory power. Moreover, comparing linear vs spline(df=3) terms showed large delta BIC in favor of the spline form, indicating substantial nonlinearity in the covariate effects.
+
+```{r model3}
+df2_10y$usdExchangeRate_s <- as.numeric(scale(df2_10y$usdExchangeRate))
+df2_10y$realGDP_s         <- as.numeric(scale(df2_10y$realGDP))
+vg_pr3 <- vgam(
+  y_adj ~ country  +
+    sm.ps(headlineInflation_s,ps.int = 6) +sm.ps(policyRate_s,ps.int = 6) +
+    realGDP_s +sm.ps(usdExchangeRate_s,ps.int = 6),
+  family = dirichlet(),
+  data = df2_10y,
+  control = vgam.control(Maxit.outer = 80, trace = FALSE)
+)
+
+vg_pr4 <- vgam(
+  y_adj ~ country  +
+    sm.ps(headlineInflation_s,ps.int = 6) +sm.ps(policyRate_s,ps.int = 6) +
+    sm.ps(realGDP_s,ps.int=6) +sm.ps(usdExchangeRate_s,ps.int = 6),
+  family = dirichlet(),
+  data = df2_10y,
+  control = vgam.control(Maxit.outer = 80, trace = FALSE)
+)
+
+
+c(AIC_pr3 = AIC(vg_pr3),  AIC_pr4 = AIC(vg_pr4))
+c(BIC_pr3 = BIC(vg_pr3),  BIC_pr4 = BIC(vg_pr4))
+
+```
+```{r perfect model}
+vg_pr5 <- vgam(
+  y_adj ~ country  + country:policyRate+
+    sm.ps(headlineInflation_s,ps.int = 6) +sm.ps(policyRate_s,ps.int = 6) +
+    sm.ps(realGDP_s,ps.int=6) +sm.ps(usdExchangeRate_s,ps.int = 6),
+  family = dirichlet(),
+  data = df2_10y,
+  control = vgam.control(Maxit.outer = 80, trace = FALSE)
+)
+
+
+c(AIC_pr4 = AIC(vg_pr4),  AIC_pr5 = AIC(vg_pr5))
+c(BIC_pr4 = BIC(vg_pr4),  BIC_pr5 = BIC(vg_pr5))
+
+
+
+
+```
+#I fit a baseline penalized-spline Dirichlet model (vg_pr4).Then I added a country × policyRate interaction (vg_pr5) to allow the policy-rate effect to vary by country.This greatly improved AIC/BIC, so the interaction seems important.However, the interaction model is computationally heavy（1h42min), so I treat vg_pr4 as a simpler reference model and vg_pr5 as the main model when country-specific policy effects are the focus.
+
+
+```{r plot}
+
+fit_mu <- fitted(vg_pr5)
+
+dfp <- df2_10y
+dfp$bank_fit <- fit_mu[, "bank"]
+dfp$bank_resid <- dfp$bank - dfp$bank_fit
+
+g7_page1 <- c("Canada", "Italy")
+g7_page2 <- c("Japan", "United Kingdom", "United States")
+g7_page3 <- c("France", "Germany")
+
+plot_g7_page <- function(cty_vec) {
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  
+  par(
+    mfrow = c(length(cty_vec), 2),
+    mar = c(3, 3.5, 2.2, 1),
+    oma = c(1, 1, 1, 0),
+    cex.main = 0.9,
+    cex.lab  = 0.9,
+    cex.axis = 0.8
+  )
+  
+  for (cty in cty_vec) {
+    tmp <- dfp[dfp$country == cty, ]
+    tmp <- tmp[order(tmp$date_m), ]
+    
+    # 1) Observed vs fitted
+    plot(
+      tmp$date_m, tmp$bank,
+      type = "l",
+      xlab = "Date", ylab = "Bank proportion",
+      main = paste("Observed vs Fitted -", cty)
+    )
+    lines(tmp$date_m, tmp$bank_fit, lty = 2)
+    legend(
+      "topright",
+      legend = c("Observed", "Fitted"),
+      lty = c(1, 2),
+      bty = "n",
+      cex = 0.8
+    )
+    
+    # 2) Residuals
+    plot(
+      tmp$date_m, tmp$bank_resid,
+      type = "h",
+      xlab = "Date", ylab = "Residual",
+      main = paste("Residuals -", cty)
+    )
+    abline(h = 0, lty = 2)
+  }
+}
+
+
+plot_g7_page(g7_page1)
+plot_g7_page(g7_page2)
+plot_g7_page(g7_page3)
+```
+
+
+#The fitted bank proportions capture the broad country-specific trends, but they are much smoother than the observed series. In most G7 countries, the observed values show substantial short-run volatility and several sharp spikes, while the fitted lines mainly reflect the underlying medium- to long-run movement rather than these temporary fluctuations.
+
+#The residual plots are generally centred around zero, which suggests that the model does not show a strong systematic bias overall. However, several countries, especially Canada, Italy, Germany, and the United States, still display large positive spikes, indicating that the model tends to underfit some extreme short-term surges in the bank component.
+
+#Overall, the plots suggest that the model provides a reasonable description of the main evolution of the bank proportion across G7 countries, but it is less successful at reproducing abrupt local shocks. This is consistent with a parsimonious smooth specification: it captures the main nonlinear trend well, while leaving high-frequency variation in the residuals.
+
+
+```{r optimize model}
+# (A) My own model
+fit_mu <- fitted(vg_pr5)
+comp <- colnames(fit_mu)   # should be c("bank","govern","growth","market","other")
+Y_adj <- as.matrix(y_adj)
+MU    <- as.matrix(fit_mu)
+
+err <- Y_adj - MU
+
+model_tab <- data.frame(
+  component = colnames(Y_adj),
+  MAE  = colMeans(abs(err)),
+  RMSE = sqrt(colMeans(err^2)),
+  Cor  = sapply(colnames(Y_adj), function(nm) cor(Y_adj[, nm], MU[, nm]))
+)
+print(model_tab)
+
+c(MAE_overall = mean(abs(err)),
+  RMSE_overall = sqrt(mean(err^2)))
+
+
+# (B) Baseline: Dirichlet country-only
+
+vg_base_country <- vglm(
+  y_adj ~ country,
+  family  = dirichlet(),
+  data    = df2_10y,
+  control = vglm.control(maxit = 3000, trace = FALSE, epsilon = 1e-7)
+)
+
+MU_dir0  <- as.matrix(fitted(vg_base_country))
+err_dir0 <- Y_adj - MU_dir0
+
+base_dir_tab <- data.frame(
+  component = colnames(Y_adj),
+  MAE  = colMeans(abs(err_dir0)),
+  RMSE = sqrt(colMeans(err_dir0^2))
+)
+print(base_dir_tab)
+
+c(MAE_overall_dir_base  = mean(abs(err_dir0)),
+  RMSE_overall_dir_base = sqrt(mean(err_dir0^2)))
+
+
+# (C) Percentage improvement of my model relative to Dirichlet baseline
+
+improve_dir <- data.frame(
+  component = colnames(Y_adj),
+  MAE_improve_pct  = 100 * (colMeans(abs(err_dir0)) - colMeans(abs(err))) / colMeans(abs(err_dir0)),
+  RMSE_improve_pct = 100 * (sqrt(colMeans(err_dir0^2)) - sqrt(colMeans(err^2))) / sqrt(colMeans(err_dir0^2))
+)
+print(improve_dir)
+
+c(
+  MAE_improve_pct_overall  = 100 * (mean(abs(err_dir0)) - mean(abs(err))) / mean(abs(err_dir0)),
+  RMSE_improve_pct_overall = 100 * (sqrt(mean(err_dir0^2)) - sqrt(mean(err^2))) / sqrt(mean(err_dir0^2))
+)
+
+
+```
+# MAE measures the typical absolute deviation (in proportion units), while RMSE penalizes larger errors more strongly.We compare these errors to a baseline because absolute MAE/RMSE values are hard to judge in isolation; the baseline provides a transparent reference to test whether the added model structure (time trend and macro effects) delivers real improvement beyond a simple, strong alternative.
+
+# I use a country-only Dirichlet regression as the baseline because it is the simplest nested version of our main Dirichlet model, it produces valid compositions (positive and summing to one), and it allows a fair likelihood-based comparison (AIC/BIC) with the full model.
+
+# Overall, my model improves fit compared with the Dirichlet country-only baseline: MAE drops from 0.02232 to 0.02077 (6.95% better) and RMSE drops from 0.03437 to 0.03244 (5.60% better).
+#Every component shows positive improvement, with the biggest gains in other (MAE 9.25%, RMSE 7.47%) and growth (MAE 8.12%, RMSE 4.86%).
+#The smallest gains are in govern (MAE 3.34%, RMSE 2.58%), but the direction is still consistently better than the baseline.
+
+
+
+
